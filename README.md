@@ -99,13 +99,31 @@ Si un módulo falla, su fallback mantiene la app viva (buenas prácticas de hack
 
 ## 4. Cómo correr
 
+### Opción A — API REST + Flutter (recomendada para el hackaton)
+
+```bash
+# 1. Instalar dependencias
+pip install -r requirements.txt
+
+# 2. Levantar el servidor backend en el puerto 8000
+uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload
+
+# 3. En otro terminal, levantar la app Flutter
+#    (desde el repo HackatonFlit-frontend)
+flutter run
+```
+
+El servidor arranca en ~2 s (entrena el modelo al inicio, cacheado).
+Endpoints disponibles en `http://localhost:8000/docs` (Swagger UI automático de FastAPI).
+
+### Opción B — Solo Streamlit (demo rápida sin Flutter)
+
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-El modelo se entrena solo al arrancar (está cacheado, tarda ~2s). El Colab
-(`TerraGuard_Arequipa_Colab.ipynb`) es para mostrar las métricas al jurado
+El Colab (`TerraGuard_Arequipa_Colab.ipynb`) es para mostrar las métricas al jurado
 con gráficos: súbanlo a Google Colab y Runtime > Run all.
 
 ---
