@@ -1,0 +1,4 @@
+# Dependencias parciales — Dev 3 (IA generativa & reporte)
+# Fusionar en requirements.txt raiz sin duplicar.
+google-generativeai>=0.5
+python-dotenv>=1.0

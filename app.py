@@ -26,7 +26,7 @@ from src.data_generator import (
 )
 from src.vision import analizar_hoja, leer_imagen_desde_bytes
 from src import model as M
-from src.reporte import generar_reporte
+from reporte import generar_reporte
 
 st.set_page_config(page_title="TerraGuard Arequipa", page_icon="🌱", layout="wide")
 
