@@ -31,7 +31,7 @@ from sklearn.metrics import (
     classification_report,
 )
 
-from data_generator import generar_dataset, FEATURES, ETIQUETAS
+from .data_generator import generar_dataset, FEATURES, ETIQUETAS
 
 
 def entrenar(df=None, seed=42):
