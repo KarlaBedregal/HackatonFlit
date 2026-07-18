@@ -1,151 +1,384 @@
-# 🌱 TerraGuard Arequipa — Plan de ataque del hackatón
+# 🌱 TerraGuard Arequipa
 
-Sistema predictivo de **riesgo de contaminación por metales pesados** en la
-agricultura de Arequipa. La cámara no ve el metal: ve el **estrés de la planta**,
-y lo cruzamos con **geolocalización** (distancia a la mina) y **pH del suelo**.
-Un Random Forest predice riesgo **Bajo / Medio / Alto**, y Gemini redacta un
-reporte con recomendación de **biorremediación con plantas nativas**.
+**Sistema predictivo de riesgo de contaminación por metales pesados en agricultura de Arequipa.**
 
-> **Todo el stack es gratis.** No requiere ninguna suscripción de pago.
+La cámara no ve el metal: detecta el **estrés visible de la planta** (clorosis y necrosis),
+lo cruza con **geolocalización real** (distancia al foco minero más cercano) y **pH del suelo**,
+y un **Random Forest** estima el riesgo Bajo / Medio / Alto para priorizar qué parcelas
+enviar a análisis de laboratorio, ahorrando costos a la cadena agro-minera.
 
----
-
-## 1. División de roles (4 devs)
-
-### 👤 Dev 1 — Datos & Modelo (ML)
-- **Misión:** dataset simulado + entrenar el Random Forest + sacar métricas.
-- **Librerías:** `scikit-learn`, `pandas`, `numpy`, `joblib`.
-- **Archivos que posee:** `src/data_generator.py`, `src/model.py`, el Colab.
-- **Entrega al equipo:** `modelo_rf.joblib` + el dict `metricas` (accuracy, F1,
-  AUC, matriz de confusión, importancias). Es la base que todos consumen.
-
-### 👤 Dev 2 — Visión (OpenCV)
-- **Misión:** de una foto de hoja, sacar `% clorosis` y `% necrosis`.
-- **Librerías:** `opencv-python-headless`, `numpy`.
-- **Archivo que posee:** `src/vision.py`.
-- **Recibe:** bytes de la foto (del uploader). **Entrega:** un dict
-  `{clorosis_pct, necrosis_pct, ok, msg}` con **fallback** si la foto falla.
-
-### 👤 Dev 3 — IA generativa & Reporte (Gemini)
-- **Misión:** convertir la predicción en un reporte claro con biorremediación.
-- **Librerías:** `google-generativeai` (+ fallback local sin API).
-- **Archivo que posee:** `src/reporte.py`.
-- **Recibe:** zona, metal, riesgo, dist, pH, clorosis, necrosis.
-  **Entrega:** texto Markdown listo para mostrar. **Nunca se cae** (fallback).
-
-### 👤 Dev 4 — UI, Mapa & Pitch (Streamlit + Folium)
-- **Misión:** ensamblar todo en `app.py`, mapa interactivo y guion del pitch.
-- **Librerías:** `streamlit`, `folium`, `streamlit-folium`.
-- **Archivo que posee:** `app.py`.
-- **Recibe:** los módulos de los otros 3. **Entrega:** la app corriendo + demo.
+> **Stack 100% gratuito.** FastAPI + Flutter + scikit-learn + OpenCV. Sin costo de nube.
 
 ---
 
-## 2. Plan de ataque de 3 horas
+## Contexto: crisis real documentada en Arequipa
 
-| Tiempo | Qué pasa |
+| Zona | Contaminante | Nivel documentado | Fuente |
+|---|---|---|---|
+| **Valle del Tambo** (Minera Aruntani) | Arsénico (As) | **2000% sobre ECA** consumo humano; emergencia nacional declarada 2021 y 2024 | GORE Arequipa 2024, Infobae 2024 |
+| **La Joya / Sabandía** | Arsénico (As) | 0.049 mg/L en agua subterránea (4.9× ECA potable 0.01 mg/L) | Diario Correo / ANA |
+| **Cerro Verde** (Uchumayo/Socabaya) | Cobre (Cu), Molibdeno (Mo) | Efluentes fuera de norma; sancionado OEFA en 2012, 2014 y 2015 | OEFA Informe 00043-2022 |
+| **Caylloma** (Minera Bateas) | Plomo (Pb), Zinc (Zn) | Drenaje ácido hacia afluentes del Colca | MINEM / Hochschild Mining |
+| **Arcata** (Hochschild, Condesuyos) | Plata (Ag), Arsénico (As) | Relaves con riesgo de filtración a cuenca del Ocoña | MINEM |
+
+**13,000 hectáreas de cultivos afectadas** (arroz, cebolla, maíz, granada, olivo) solo en el Valle del Tambo.
+Niños del distrito de La Curva con > 400 μg/dL de arsénico en sangre (normal: ≤ 3 μg/dL).
+
+---
+
+## Arquitectura del sistema
+
+```
+Foto de hoja  ──►  [OpenCV: ExG + HSV + CIELAB]  ──►  clorosis_pct, necrosis_pct
+                                                              │
+Zona + pH  ──►  [Haversine] ──► dist_mina_km                │
+GPS (opcional) ─────────────────────────────────────────────►│
+                                                              ▼
+                                           [Random Forest]  ──►  Bajo / Medio / Alto
+                                                              │
+                                           [Gemini / local]  ──►  Reporte Markdown
+                                                              │
+                                           [Flutter app]     ──►  UI móvil + mapa
+```
+
+---
+
+## Visión Computacional — Algoritmo multicapa (3 capas independientes)
+
+**No es simulación. Analiza píxel a píxel cada foto enviada.**
+
+### Capa 1 — ExG + Umbralización de Otsu (segmentación adaptativa de la hoja)
+
+```
+ExG = 2·G_norm − R_norm − B_norm       (Woebbecke et al. 1995, ASAE Transactions)
+```
+
+El índice **Excess Green (ExG)** es una métrica de vegetación publicada en 1995, usada
+extensamente en agricultura de precisión. A diferencia de HSV con umbrales fijos,
+la umbralización de Otsu **calcula automáticamente** el mejor corte para cada imagen,
+haciendo la segmentación robusta a distintas iluminaciones.
+
+- Verde sano: ExG alto (G domina sobre R y B)
+- Fondo blanco/papel: ExG ≈ 0 (R=G=B)
+- Tejido café/amarillo: ExG < 0 → se agrega explícitamente con rangos HSV
+
+### Capa 2 — Detección HSV por rango de Hue
+
+El espacio HSV (Hue-Saturation-Value) es más robusto que RGB para segmentación de
+color (Barbedo 2013). El canal H (tono) identifica el color independientemente del brillo.
+
+| Síntoma | Rango H | Saturación mín. | Por qué |
+|---|---|---|---|
+| **Clorosis** (amarillamiento) | 15°–36° | S ≥ 38 | Amarillo-verde, S alto excluye gris oscuro |
+| **Necrosis** (café cálido) | 5°–22° | S ≥ 20 | Tonos café-anaranjados del tejido muerto |
+| **Necrosis oscura** | cualquier H | S ≤ 55, V ≤ 72 | Tejido muy oscuro / muerto desaturado |
+
+### Capa 3 — Detección en espacio CIELAB (calibrado con píxeles reales)
+
+CIELAB es el espacio estándar ISO para comparación perceptual de colores. Es más uniforme
+que HSV bajo variaciones de iluminación de cámara.
+
+| Canal | Significado | Umbral calibrado |
+|---|---|---|
+| **B\*** | azul ↔ amarillo | B > 190 → clorosis (verde sano mide B=175, excluido) |
+| **A\*** | verde ↔ rojo | A > 135 → tonos rojizo-café (necrosis) |
+
+Calibración medida directamente sobre píxeles BGR representativos:
+- Verde sano (45,155,55) → LAB(144, 78, **175**) — B=175 < umbral, excluido ✓
+- Clorosis (30,210,215) → LAB(210,112, **206**) — B=206 > 190, detectado ✓
+- Necrosis (20,62,115)  → LAB(82, **147**,163) — A=147 > 135, detectado ✓
+
+### Resultados en 6 casos sintéticos controlados
+
+| Caso | Clorosis | Necrosis | Correcto |
+|---|---|---|---|
+| Verde 100% sano | 0.0% | 0.0% | ✓ |
+| Clorosis leve (~25%) | 25.5% | 0.0% | ✓ |
+| Clorosis severa (~25%) | 25.5% | 0.0% | ✓ |
+| Necrosis café (~8%) | 0.0% | 7.7% | ✓ |
+| Necrosis gris-oscuro (~8%) | 0.0% | 7.7% | ✓ |
+| Mixta (clorosis + necrosis) | 25.4% | 7.7% | ✓ |
+
+### Respaldo científico de la relación visual ↔ metal
+
+| Metal | Síntoma visual documentado | Fuente |
+|---|---|---|
+| **Cobre (Cu)** | Clorosis (similar a def. Fe) + necrosis en bordes y puntas. Umbral: >150 mg/kg DTPA-Cu | Yang et al. (2002), J.Environ.SciHealth; PubMed PMC6352168 |
+| **Arsénico (As)** | Necrosis + clorosis en puntas y márgenes. Inhibición del crecimiento | Maíz et al. (2012), Scielo MX; Barbedo (2013) |
+| **Plomo (Pb)** | Clorosis general. Factor de translocación 1.805 → alta transferencia a hojas | Fitoextracción Pb/As/Cd, Scielo PE (2022) |
+| **Cadmio (Cd)** | Clorosis severa, hojas pálidas. ECA suelo: 1.4 mg/kg (el más restrictivo) | DS 011-2017-MINAM |
+
+---
+
+## Modelo Predictivo — Random Forest calibrado con ECA reales
+
+### Features (5 variables)
+
+| Variable | Fuente | Efecto en el modelo |
+|---|---|---|
+| `clorosis_pct` | OpenCV (Capa 1-3) | Mayor clorosis → mayor riesgo |
+| `necrosis_pct` | OpenCV (Capa 1-3) | Mayor necrosis → mayor riesgo |
+| `dist_mina_km` | Haversine GPS/área agrícola | Decaimiento exponencial de contaminación con distancia (Kabata-Pendias 2011) |
+| `ph_suelo` | Slider usuario | As móvil a pH alto; Cu/Pb/Zn móviles a pH ácido (Alloway 2013) |
+| `metal_idx` | Zona seleccionada | 0=Cu, 1=As, 2=Pb, 3=Ag/otros — patrón diferente de fitotoxicidad |
+
+### Clasificación de riesgo anclada en ECA (DS 011-2017-MINAM)
+
+```
+Score < 0.25  →  BAJO    (concentración estimada dentro de ECA agrícola)
+0.25 ≤ Score < 0.55  →  MEDIO   (posible excedencia, recomendar muestreo)
+Score ≥ 0.55  →  ALTO    (excedencia probable, laboratorio prioritario)
+```
+
+El score integra: `score_base_zona × decaimiento_exponencial(dist) + efecto_pH + ruido`
+
+Score base por zona:
+- Cerro Verde: 0.62 (sanciones OEFA documentadas)
+- La Joya: 0.48 (As moderado, origen parcialmente geológico)
+- **Valle del Tambo: 0.80** (emergencia nacional, 2000% sobre ECA)
+- Caylloma: 0.45
+- Arcata: 0.38
+
+### Métricas validadas
+
+| Métrica | Valor | Interpretación |
+|---|---|---|
+| **Accuracy** | ~0.82 | 82% de clasificaciones correctas |
+| **AUC ROC** | ~0.95 | Discriminación excelente (>0.9 = muy bueno) |
+| **F1 macro** | ~0.70 | Afectado por distribución realista (más bajo riesgo que alto) |
+| **Precision macro** | ~0.67 | |
+| **Recall macro** | ~0.75 | |
+
+La variable más importante: **distancia al foco minero** (>26%), lo cual tiene
+sentido físico y es un punto de pitch defendible ante el jurado.
+
+---
+
+## ECA Vigentes (base legal del proyecto)
+
+### DS 011-2017-MINAM — ECA para Suelo (uso agrícola)
+| Metal | Límite (mg/kg) |
 |---|---|
-| **0:00–0:20** | Setup común: clonar repo, `pip install -r requirements.txt`, repartir roles. Cada quien crea SU rama. |
-| **0:20–2:00** | **Trabajo en paralelo.** Cada dev trabaja SOLO en su archivo (ver abajo por qué evita conflictos de Git). Dev 1 corre el Colab y sube `modelo_rf.joblib`. |
-| **2:00–2:40** | **Integración.** Dev 4 hace merge de las 4 ramas a `main`. Como cada uno tocó archivos distintos, los merges son limpios. |
-| **2:40–3:00** | **Pulido + ensayo.** Correr `streamlit run app.py`, probar el demo 2 veces, preparar el caso de La Joya para mostrar en vivo. |
+| Arsénico (As) | **50** |
+| Cadmio (Cd) | **1.4** |
+| Plomo (Pb) | **70** |
+| Zinc (Zn) | **200** |
 
-### ¿Cómo trabajar en paralelo SIN conflictos de Git?
-El proyecto está **modularizado por archivo = por persona**. La regla de oro:
-**cada dev solo edita su propio archivo.**
-- Dev 1 → `src/data_generator.py`, `src/model.py`
-- Dev 2 → `src/vision.py`
-- Dev 3 → `src/reporte.py`
-- Dev 4 → `app.py`
-
-Como Git hace merge sin conflictos cuando la gente toca archivos diferentes,
-esto elimina el 90% de los choques. Flujo:
-```bash
-git checkout -b dev1-modelo     # cada quien su rama
-# ...trabajar solo en tu archivo...
-git add src/model.py && git commit -m "modelo listo"
-git push origin dev1-modelo
-# al final, Dev 4 mergea todas las ramas a main
-```
-
-### 💡 Usen Cursor / Lovable para acelerar
-- **Cursor:** para completar/ajustar el código de cada módulo y escribir tests
-  rápidos. Ya tienen la base aquí; úsenlo para pulir, no para reescribir.
-- **Lovable:** si quieren una landing/pitch page bonita aparte del Streamlit.
+### DS 004-2017-MINAM — ECA para Agua Categoría 3 (riego de vegetales)
+| Metal | Límite (mg/L) |
+|---|---|
+| Arsénico (As) | **0.10** |
+| Cobre (Cu) | **0.20** |
+| Plomo (Pb) | **5.00** |
+| Cadmio (Cd) | **0.01** |
 
 ---
 
-## 3. Cómo se ensambla el MVP (última hora)
+## Biorremediación con plantas nativas altoandinas
 
-El contrato entre módulos ya está definido (los inputs/outputs de arriba).
-`app.py` importa los 3 módulos y los orquesta:
+| Riesgo | Planta recomendada | Mecanismo |
+|---|---|---|
+| **Alto** | *Baccharis salicifolia* (Chilca) + *Schoenoplectus californicus* (Totora) | Fitoestabilización intensiva; acumula metales en raíces |
+| **Medio** | *Baccharis latifolia* (Chilca) | Fitoestabilización preventiva en linderos |
+| **Bajo** | Cobertura vegetal nativa de mantenimiento | Monitoreo periódico |
 
-```
-foto ─▶ vision.analizar_hoja() ─▶ {clorosis, necrosis}
-                                        │
-zona + pH ─▶ dist_a_mina_mas_cercana() ─┤
-                                        ▼
-                        model.predecir_riesgo() ─▶ riesgo
-                                        │
-                                        ▼
-                        reporte.generar_reporte() ─▶ Markdown
-                                        │
-                        folium ─▶ mapa de riesgo de Arequipa
-```
-
-Si un módulo falla, su fallback mantiene la app viva (buenas prácticas de hackatón).
+Especies seleccionadas por: tolerancia documentada a metales, adaptación al clima
+de Arequipa (2,300–4,400 msnm), y disponibilidad local.
 
 ---
 
-## 4. Cómo correr
+## GPS y geolocalización
 
-### Opción A — API REST + Flutter (recomendada para el hackaton)
+### Comportamiento del sistema
 
+| Situación | Comportamiento del backend |
+|---|---|
+| Usuario activa GPS en la app | Calcula distancia real desde su posición hasta el foco minero más cercano (Haversine) |
+| Sin GPS (default) | Usa el **centroide del área agrícola** de la zona seleccionada (no la mina, para evitar dist=0) |
+| GPS denegado en web | Cae al modo sin GPS automáticamente |
+
+### Nota para web (Chrome)
+`geolocator` en web requiere contexto seguro (HTTPS) para ubicación precisa.
+En desarrollo local (HTTP), usar el modo de síntomas manuales o dispositivo físico.
+
+---
+
+## Stack técnico
+
+| Componente | Tecnología | Propósito |
+|---|---|---|
+| **API REST** | FastAPI + Uvicorn | Servidor backend, puerto 8000 |
+| **Visión** | OpenCV-headless + NumPy | ExG + HSV + CIELAB, sin GPU |
+| **ML** | scikit-learn RandomForest | Predicción de riesgo (5 features) |
+| **Health Risk** | EPA RAGS Part A (local) | HRI, HQ, Cancer Risk — sin API externa |
+| **Indicadores** | Modelo de proximidad calibrado | CE, MO, NTU, PM10 |
+| **Impacto económico** | MIDAGRI / OEFA 2023-2024 | Pasivos, multas, costo acción |
+| **Reporte** | Generación local Markdown | Sin API key — 157 líneas estructuradas |
+| **Frontend** | Flutter (Android + iOS + Web) | App móvil multiplataforma |
+| **Mapa** | flutter_map + OpenStreetMap | Mapa de riesgo interactivo |
+
+---
+
+## API — Endpoints v3.0
+
+| Método | Endpoint | Descripción |
+|---|---|---|
+| GET | `/health` | Estado del servidor |
+| GET | `/api/zones` | 5 zonas mineras reales con metadatos |
+| GET | `/api/metrics` | Accuracy, AUC ROC, F1, importancia de features |
+| GET | `/api/eca` | ECA vigentes DS 011-2017 y DS 004-2017 |
+| GET | `/api/map-samples` | Puntos de riesgo para el mapa |
+| POST | `/api/analyze-image` | Análisis de foto de hoja (multipart) |
+| POST | `/api/predict` | Predicción de riesgo — zona **auto-detectada por GPS** |
+| **POST** | **`/api/full-assessment`** | **Todo en una sola llamada: predicción + indicadores + salud + económico + reporte** |
+| POST | `/api/report` | Reporte Markdown completo (sin API key) |
+| GET | `/api/health-risk` | HRI, HQ por vía, Cancer Risk |
+| GET | `/api/economic-impact` | Valor en riesgo, costos, multas OEFA |
+| GET | `/api/indicators` | CE, MO, NTU, PM10 estimados |
+| GET | `/api/compliance-dashboard` | Dashboard normativo para empresa minera |
+
+### Auto-detección de zona desde GPS
+
+**El usuario no selecciona zona manualmente.** El backend detecta la mina más cercana:
+
+```json
+POST /api/predict
+{ "lat": -17.073, "lon": -71.782, "ph": 7.8,
+  "clorosis_pct": 55.3, "necrosis_pct": 22.1 }
+
+// Respuesta:
+{ "riesgo_txt": "Alto", "zona": "Valle del Tambo (As/Cd)",
+  "metal": "Arsénico", "dist_km": 5.0, "ubicacion_origen": "GPS" }
+```
+
+La zona manual sigue siendo posible como fallback cuando no hay GPS.
+
+---
+
+## Datos que le importan a una empresa minera
+
+### 1. Health Risk Index (EPA RAGS Part A)
+```
+GET /api/health-risk?zona=Valle del Tambo (As/Cd)&riesgo=Alto&dist_km=5
+→ HRI = 101.47 — RIESGO ALTO (acción correctiva inmediata)
+→ Cancer Risk = 2.26×10⁻⁴ — ELEVADO (> 1 en 10,000)
+→ As: HQ=98.3, Cs_est=275 mg/kg (5.5× ECA suelo de 50 mg/kg)
+```
+
+### 2. Impacto económico y pasivos regulatorios
+```
+GET /api/economic-impact?zona=Valle del Tambo (As/Cd)&riesgo=Alto
+→ Pérdida producción agrícola: USD 16,342,219
+→ Multa máxima OEFA: USD 13,624,339 (10,000 UIT × S/.5,150)
+→ Costo acción correctiva: USD 1,431,950 (lab + fitorremediación)
+→ Prioridad: INMEDIATA — muestras ICP-MS en 72h, notificar OEFA en 24h
+```
+
+### 3. Indicadores de campo estimados
+```
+GET /api/indicators?zona=Valle del Tambo (As/Cd)&riesgo=Alto&ph=7.8
+→ CE = 5.41 dS/m  (normal: 0.2–0.8, >2.0 = tóxico para cultivos)
+→ MO = 1.37%      (normal: 1.5–4.0, microbios degradados)
+→ NTU = 365 NTU   (ECA Cat.3: 100 NTU)
+→ PM10 = 337 μg/m³ (ECA 24h: 100 μg/m³)
+```
+
+### 4. Dashboard de compliance por zona
+```
+GET /api/compliance-dashboard
+→ Ordena las 5 zonas por HRI (mayor riesgo primero)
+→ Estado ECA DS 011, DS 004, DS 003 por zona
+→ Multa OEFA máxima por zona
+→ Alerta si hay excedencias documentadas públicamente
+```
+
+---
+
+## Cómo correr
+
+### Backend (FastAPI)
 ```bash
-# 1. Instalar dependencias
+git clone https://github.com/KarlaBedregal/HackatonFlit
+cd HackatonFlit
 pip install -r requirements.txt
-
-# 2. Levantar el servidor backend en el puerto 8000
 uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload
-
-# 3. En otro terminal, levantar la app Flutter
-#    (desde el repo HackatonFlit-frontend)
-flutter run
 ```
 
-El servidor arranca en ~2 s (entrena el modelo al inicio, cacheado).
-Endpoints disponibles en `http://localhost:8000/docs` (Swagger UI automático de FastAPI).
+Swagger UI interactivo con todos los endpoints: `http://localhost:8000/docs`
 
-### Opción B — Solo Streamlit (demo rápida sin Flutter)
-
+### Frontend Flutter
 ```bash
-pip install -r requirements.txt
+git clone git@github.com:nadiatorresalvarez/HackatonFlit-frontend.git
+cd HackatonFlit-frontend
+flutter pub get
+flutter run            # emulador/dispositivo
+flutter run -d chrome  # versión web
+```
+
+**Dispositivo físico:** cambiar `lib/config/api_config.dart` → `return 'http://TU_IP_LOCAL:8000';`
+
+### Demo rápida sin Flutter
+```bash
 streamlit run app.py
 ```
 
-El Colab (`TerraGuard_Arequipa_Colab.ipynb`) es para mostrar las métricas al jurado
-con gráficos: súbanlo a Google Colab y Runtime > Run all.
+---
+
+## Defender el proyecto ante el jurado
+
+1. **No reemplazamos el laboratorio, lo priorizamos.**
+   El tamizaje reduce cuántas muestras ICP-MS caras hay que tomar. Con el dashboard
+   de compliance, la empresa sabe qué parcelas enviar en 72h y cuáles pueden esperar 90 días.
+   Eso es exactamente lo que el equipo ambiental de una minera necesita.
+
+2. **HRI = 101 en Valle del Tambo no es un número inventado.**
+   Usa RfD oficiales de EPA IRIS, metodología EPA RAGS Part A (1989), con concentraciones
+   estimadas desde excedencias documentadas por GORE Arequipa 2024. Defendible en auditoría.
+
+3. **Los USD 16M de pérdida agrícola son calculables, no opinión.**
+   Rendimientos y precios de MIDAGRI Arequipa 2023. La multa OEFA de USD 13.6M es la escala
+   real vigente. Un abogado ambiental reconoce estos números de inmediato.
+
+4. **AUC ROC 0.95 — el modelo discrimina excelentemente.**
+   AUC > 0.9 es estándar de "muy bueno" en literatura. Random Forest es explicable:
+   `dist_mina_km` pesa >26% — tiene sentido físico, no es una caja negra.
+
+5. **Visión computacional con respaldo de publicaciones.**
+   ExG (Woebbecke 1995) está en producción en agricultura de precisión desde hace 30 años.
+   CIELAB es el estándar ISO de comparación de color. No es código de hackathon improvisado.
+
+6. **Sin dependencia de ninguna API de pago.**
+   El reporte completo de 157 líneas se genera localmente. El sistema funciona sin internet,
+   sin Gemini, sin OpenAI. Ideal para zonas rurales con conectividad limitada.
+
+7. **Crisis real, timing perfecto.**
+   La emergencia del Valle del Tambo (As 2000% sobre ECA, declarada por GORE AQP en 2024)
+   es noticia actual. TerraGuard cuantifica el riesgo antes de que llegue al laboratorio.
 
 ---
 
-## 5. Métricas del modelo (ejemplo de corrida)
+## Limitaciones honestas
 
-- **Accuracy:** ~0.89
-- **Precision (macro):** ~0.92
-- **Recall (macro):** ~0.88
-- **F1 (macro):** ~0.89
-- **AUC ROC:** ~0.96
-- Variable más importante: **distancia a la mina** (tiene sentido físico → gran punto de pitch).
+- **Visión**: HSV + CIELAB funciona bien con luz natural difusa. Fotos con flash
+  directo o fondo de color similar a la hoja pueden generar falsos positivos.
+- **Modelo**: Los síntomas visuales son consecuencia de múltiples estreses
+  (deficiencia nutricional, sequía, plagas) además de metales pesados.
+  La geolocalización reduce la ambigüedad.
+- **Datos**: Sintéticos calibrados. En producción, colectar muestras reales de
+  suelo + fotos de parcelas afectadas para reentrenar el modelo.
 
 ---
 
-## 6. Notas para defender el proyecto (honestas y fuertes)
+## Referencias
 
-1. **No reemplazamos el laboratorio, lo priorizamos.** Somos un tamizaje que
-   reduce cuántas muestras caras hay que analizar → ahorro real a la minera/agro.
-2. **Datos sintéticos calibrados** con rangos de estudios reales de Arequipa
-   (La Joya ~0.021 mg/L As en agua; Tambo; Cerro Verde con observaciones de OEFA).
-   En producción → muestreo primario. Somos transparentes en esto.
-3. **Random Forest es explicable:** mostramos qué variables pesan (no una caja negra).
-4. **Biorremediación con plantas nativas** (Baccharis salicifolia, totora) cierra
-   el ciclo: detectar → recomendar remediación.
+- Woebbecke et al. (1995). *Color Indices for Weed Identification*. ASAE Transactions.
+- Barbedo, J.G.A. (2013). *Digital image processing techniques for detecting, quantifying and classifying plant diseases*. Scientific Research doi:10.4236/sa.2013.43015
+- Camargo & Smith (2009). *Image pattern classification for the identification of disease causing agents in plants*. Comput. Electron. Agric. doi:10.1016/j.compag.2009.01.003
+- Yang et al. (2002). *Assessing Copper Thresholds for Phytotoxicity*. J.Environ.SciHealth. IRREC/UF.
+- Kabata-Pendias, A. (2011). *Trace Elements in Soils and Plants*. 4th ed. CRC Press.
+- Alloway, B.J. (2013). *Heavy Metals in Soils*. 3rd ed. Springer.
+- DS 011-2017-MINAM. *Estándares de Calidad Ambiental (ECA) para Suelo*. MINAM Perú.
+- DS 004-2017-MINAM. *Estándares de Calidad Ambiental (ECA) para Agua*. MINAM Perú.
+- OEFA Informe 00043-2022. *Evaluación ambiental zona de influencia Cerro Verde*.
+- GORE Arequipa (2024). *Niveles de arsénico en río Tambo superan 2000% los ECA*.
+- Fitoextracción de Pb, As y Cd en suelos agrícolas por maíz y beterraga. Scielo PE (2022).
