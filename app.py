@@ -1,71 +1,198 @@
 """
 app.py  -  TerraGuard Arequipa
 ------------------------------
-MVP: sistema predictivo de riesgo de contaminacion por metales pesados
-en la agricultura de Arequipa.
+MVP: tamizaje predictivo de riesgo de contaminacion por metales pesados.
 
 Flujo:
-  1) Sube foto de hoja  -> OpenCV extrae clorosis/necrosis
-  2) Elige zona + pH    -> se calcula distancia a la mina
-  3) Random Forest      -> predice riesgo Bajo/Medio/Alto
-  4) Gemini (o fallback)-> reporte con biorremediacion
-  5) Folium             -> mapa de riesgo de Arequipa
+  1) Usuario indica ubicacion de parcela (dropdown o clic en mapa)
+  2) Distancia geodesica (geopy) al proyecto minero mas cercano
+  3) pH por lookup de zona (o manual si tiene dato de campo)
+  4) Foto opcional -> OpenCV extrae clorosis/necrosis
+  5) Random Forest -> riesgo Bajo/Medio/Alto
+  6) Folium muestra parcela coloreada por riesgo
 
 Ejecutar:  streamlit run app.py
 """
-
-import sys, os
-sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-from src.data_generator import (
-    generar_dataset, ZONAS_RIESGO, dist_a_mina_mas_cercana, ETIQUETAS
+from data_generator import (
+    generar_dataset_hibrido,
+    ZONAS_PARCELA,
+    PROYECTOS_MINEROS,
+    PH_POR_ZONA,
+    ETIQUETAS,
+    coords_parcela_desde_zona,
+    zona_parcela_desde_coordenadas,
+    calcular_distancia_proyecto,
+    obtener_ph_por_zona,
 )
-from src.vision import analizar_hoja, leer_imagen_desde_bytes
-from src import model as M
-from src.reporte import generar_reporte
+from vision import analizar_hoja, leer_imagen_desde_bytes
+import model as M
+from reporte import generar_reporte
 
 st.set_page_config(page_title="TerraGuard Arequipa", page_icon="🌱", layout="wide")
 
 COLOR_RIESGO = {"Bajo": "#2e7d32", "Medio": "#f9a825", "Alto": "#c62828"}
+COLOR_RIESGO_FOLIUM = {"Bajo": "green", "Medio": "orange", "Alto": "red"}
+DEFAULT_ZONA = "La Joya (vinedos)"
 
 
-# ---------- Carga cacheada de datos y modelo ----------
+def _init_session():
+    if "parcela_lat" not in st.session_state:
+        p = coords_parcela_desde_zona(DEFAULT_ZONA)
+        st.session_state.parcela_lat = p["lat"]
+        st.session_state.parcela_lon = p["lon"]
+        st.session_state.parcela_nombre = p["nombre_zona"]
+        st.session_state.zona_ph = p["zona_ph"]
+        st.session_state.ubicacion_fuente = "dropdown"
+        st.session_state.last_click = None
+
+
+def _actualizar_desde_dropdown(nombre_zona: str):
+    p = coords_parcela_desde_zona(nombre_zona)
+    st.session_state.parcela_lat = p["lat"]
+    st.session_state.parcela_lon = p["lon"]
+    st.session_state.parcela_nombre = p["nombre_zona"]
+    st.session_state.zona_ph = p["zona_ph"]
+    st.session_state.ubicacion_fuente = "dropdown"
+    st.session_state.last_click = None
+
+
+def _actualizar_desde_mapa(lat: float, lon: float):
+    zp = zona_parcela_desde_coordenadas(lat, lon)
+    st.session_state.parcela_lat = lat
+    st.session_state.parcela_lon = lon
+    st.session_state.parcela_nombre = f"Mapa — cerca de {zp['nombre_zona']}"
+    st.session_state.zona_ph = zp["zona_ph"]
+    st.session_state.ubicacion_fuente = "mapa"
+    st.session_state.last_click = (lat, lon)
+
+
 @st.cache_resource
 def cargar_todo():
-    df = generar_dataset()
-    modelo, metricas, _ = M.entrenar(df)
+    modelo, metricas, _ = M.entrenar(modo="hibrido")
+    df = generar_dataset_hibrido()
     return df, modelo, metricas
 
 
+def _crear_mapa(lat, lon, riesgo_txt=None):
+    import folium
+
+    m = folium.Map(location=[lat, lon], zoom_start=9, tiles="CartoDB positron")
+
+    for nombre, info in PROYECTOS_MINEROS.items():
+        folium.Marker(
+            [info["lat"], info["lon"]],
+            tooltip=f"{nombre} — {info['tipo']}",
+            popup=folium.Popup(f"<b>{nombre}</b><br>{info['tipo']}", max_width=220),
+            icon=folium.Icon(color="darkred", icon="industry", prefix="fa"),
+        ).add_to(m)
+
+    color = COLOR_RIESGO.get(riesgo_txt, "#1976d2")
+    folium_color = COLOR_RIESGO_FOLIUM.get(riesgo_txt, "blue")
+    etiqueta = riesgo_txt or "Parcela"
+
+    folium.CircleMarker(
+        [lat, lon],
+        radius=14,
+        color=color,
+        fill=True,
+        fill_color=color,
+        fill_opacity=0.85,
+        weight=3,
+        popup=folium.Popup(
+            f"<b>Tu parcela</b><br>Riesgo: {etiqueta}<br>Lat: {lat:.4f}, Lon: {lon:.4f}",
+            max_width=240,
+        ),
+        tooltip=f"Tu parcela — Riesgo {etiqueta}",
+    ).add_to(m)
+
+    folium.Marker(
+        [lat, lon],
+        icon=folium.Icon(color=folium_color, icon="leaf", prefix="fa"),
+    ).add_to(m)
+
+    return m
+
+
+_init_session()
 df, modelo, metricas = cargar_todo()
 
-# ---------- Encabezado ----------
 st.title("🌱 TerraGuard Arequipa")
-st.caption("Tamizaje predictivo de riesgo de contaminacion por metales pesados "
-           "para priorizar muestreo de laboratorio y ahorrar costos a la mineria y agro.")
+st.caption(
+    "Tamizaje predictivo de riesgo de contaminacion por metales pesados "
+    "para priorizar muestreo de laboratorio."
+)
 
 col_izq, col_der = st.columns([1, 1])
 
-# =========================================================
-#  COLUMNA IZQUIERDA: entrada de datos y prediccion
-# =========================================================
+# --- PASO 1: UBICACION DE PARCELA (independiente de la foto) ---
 with col_izq:
-    st.subheader("1. Datos de la parcela")
+    st.subheader("1. Ubicacion de tu parcela")
+    st.caption("Indica donde esta tu parcela. Este paso es independiente de la foto.")
 
-    zona = st.selectbox("Zona / foco de riesgo cercano", list(ZONAS_RIESGO.keys()))
-    metal = "Cobre" if "Cerro Verde" in zona else "Arsenico"
-    st.info(f"Metal de interes en esta zona: **{metal}**")
+    zonas_list = list(ZONAS_PARCELA.keys())
+    idx = zonas_list.index(st.session_state.parcela_nombre) if st.session_state.parcela_nombre in zonas_list else 0
 
-    ph = st.slider("pH del suelo", 4.0, 9.0, 6.5, 0.1,
-                   help="Un pH acido (<6) aumenta la movilidad del arsenico.")
+    zona_dropdown = st.selectbox(
+        "Zona agricola (lista)",
+        zonas_list,
+        index=idx,
+        help="Selecciona la zona mas cercana a tu parcela.",
+    )
 
-    st.subheader("2. Foto de la hoja (opcional)")
-    foto = st.file_uploader("Sube una foto de la hoja del cultivo",
-                            type=["jpg", "jpeg", "png"])
+    if st.session_state.ubicacion_fuente == "dropdown":
+        _actualizar_desde_dropdown(zona_dropdown)
+    elif st.button("Volver a usar la zona del listado"):
+        _actualizar_desde_dropdown(zona_dropdown)
+        st.rerun()
+
+    if st.session_state.ubicacion_fuente == "mapa":
+        st.success(
+            f"Ubicacion por **clic en mapa**: "
+            f"{st.session_state.parcela_lat:.4f}, {st.session_state.parcela_lon:.4f}"
+        )
+    else:
+        st.info(f"Ubicacion: **{st.session_state.parcela_nombre}**")
+
+    dist_info = calcular_distancia_proyecto(
+        st.session_state.parcela_lat, st.session_state.parcela_lon
+    )
+    dist = dist_info["dist_km"]
+    metal = PH_POR_ZONA[st.session_state.zona_ph]["metal_principal"]
+
+    st.metric("Distancia al proyecto minero mas cercano", f"{dist} km")
+    st.caption(
+        f"Proyecto: **{dist_info['proyecto_cercano']}** ({dist_info['tipo_proyecto']})"
+    )
+    with st.expander("Distancias a Cerro Verde y Tia Maria"):
+        for proj, d in dist_info["distancias_todos"].items():
+            st.write(f"- **{proj}**: {d} km")
+
+    st.subheader("2. pH del suelo")
+    ph_lookup = obtener_ph_por_zona(st.session_state.zona_ph)
+    ph_manual = st.checkbox(
+        "Tengo medicion de campo (usar pH manual)",
+        help="Si tienes un dato de laboratorio o kit de campo, ingresalo aqui.",
+    )
+    if ph_manual:
+        ph = st.number_input(
+            "pH medido en tu parcela",
+            min_value=4.0, max_value=9.0, value=float(ph_lookup), step=0.1,
+        )
+    else:
+        ph = ph_lookup
+        st.info(
+            f"pH estimado por zona: **{ph}** "
+            f"(lookup — {PH_POR_ZONA[st.session_state.zona_ph]['fuente'][:70]}...)"
+        )
+
+    st.subheader("3. Foto de la hoja (opcional)")
+    st.caption("La foto solo analiza sintomas visuales; no define la ubicacion.")
+    foto = st.file_uploader("Sube una foto de la hoja del cultivo", type=["jpg", "jpeg", "png"])
 
     if foto is not None:
         img = leer_imagen_desde_bytes(foto.read())
@@ -73,93 +200,100 @@ with col_izq:
             vis = analizar_hoja(img)
             st.image(foto, caption="Hoja analizada", width=250)
         else:
-            vis = analizar_hoja(np.zeros((10, 10, 3), np.uint8))  # fuerza fallback
+            vis = analizar_hoja(np.zeros((10, 10, 3), np.uint8))
             st.warning("No se pudo leer la imagen, usando estimacion de respaldo.")
     else:
-        # Sin foto: sliders manuales (util para el simulador del jurado)
         st.markdown("*Sin foto: ajusta manualmente los sintomas visuales*")
         c1, c2 = st.columns(2)
         vis = {
             "clorosis_pct": c1.slider("Clorosis %", 0, 100, 30),
             "necrosis_pct": c2.slider("Necrosis %", 0, 100, 15),
-            "ok": True, "msg": "manual",
+            "ok": True,
+            "msg": "manual",
         }
 
-    # Distancia a la mina (centro de la zona elegida)
-    zlat, zlon = ZONAS_RIESGO[zona]
-    _, dist = dist_a_mina_mas_cercana(zlat, zlon)
+    st.write(
+        f"Clorosis: **{vis['clorosis_pct']:.0f}%** | "
+        f"Necrosis: **{vis['necrosis_pct']:.0f}%**"
+    )
 
-    st.metric("Distancia al foco minero", f"{dist} km")
-    st.write(f"Clorosis detectada: **{vis['clorosis_pct']:.0f}%**  |  "
-             f"Necrosis detectada: **{vis['necrosis_pct']:.0f}%**")
-
-    # ---------- Prediccion ----------
     pred = M.predecir_riesgo(modelo, vis["clorosis_pct"], vis["necrosis_pct"], dist, ph)
     riesgo_txt = pred["riesgo_txt"]
 
+    st.subheader("4. Resultado")
     st.markdown(
         f"<h2 style='color:{COLOR_RIESGO[riesgo_txt]}'>Riesgo: {riesgo_txt} "
-        f"({pred['confianza']}% conf.)</h2>", unsafe_allow_html=True)
+        f"({pred['confianza']}% conf.)</h2>",
+        unsafe_allow_html=True,
+    )
     st.write("Probabilidades:", pred["probabilidades"])
 
-    # ---------- Reporte con IA ----------
-    st.subheader("3. Reporte y biorremediacion")
-    api_key = st.text_input("API key de Gemini (opcional)", type="password",
-                            help="Sin key, se genera un reporte local igual de valido.")
+    st.subheader("5. Reporte y biorremediacion")
+    api_key = st.text_input("API key de Gemini (opcional)", type="password")
     if st.button("Generar reporte", type="primary"):
         with st.spinner("Generando reporte..."):
-            rep = generar_reporte(zona, metal, riesgo_txt, dist, ph,
-                                  vis["clorosis_pct"], vis["necrosis_pct"],
-                                  api_key=api_key or None)
+            rep = generar_reporte(
+                st.session_state.parcela_nombre, metal, riesgo_txt, dist, ph,
+                vis["clorosis_pct"], vis["necrosis_pct"],
+                api_key=api_key or None,
+            )
         st.markdown(rep)
 
-# =========================================================
-#  COLUMNA DERECHA: mapa y metricas del modelo
-# =========================================================
+# --- MAPA INTERACTIVO ---
 with col_der:
-    st.subheader("Mapa de riesgo - Arequipa")
+    st.subheader("Mapa — Arequipa")
+    st.caption("Haz **clic** en el mapa para marcar tu parcela. Tambien puedes usar el listado.")
+
     try:
         import folium
         from streamlit_folium import st_folium
 
-        m = folium.Map(location=[-16.6, -71.7], zoom_start=8, tiles="CartoDB positron")
-        # Focos de riesgo conocidos
-        for nombre, (la, lo) in ZONAS_RIESGO.items():
-            folium.Marker([la, lo], tooltip=nombre,
-                          icon=folium.Icon(color="red", icon="industry", prefix="fa")
-                          ).add_to(m)
-        # Muestras del dataset coloreadas por riesgo
-        muestra = df.sample(min(150, len(df)), random_state=1)
-        for _, r in muestra.iterrows():
-            c = COLOR_RIESGO[ETIQUETAS[r["riesgo"]]]
-            folium.CircleMarker([r["lat"], r["lon"]], radius=3,
-                                color=c, fill=True, fill_opacity=0.6).add_to(m)
-        st_folium(m, height=380, width=None)
-    except Exception as e:
-        st.warning(f"Mapa no disponible ({e}). Mostrando tabla de zonas.")
-        st.dataframe(pd.DataFrame(
-            [(n, la, lo) for n, (la, lo) in ZONAS_RIESGO.items()],
-            columns=["Zona", "Lat", "Lon"]))
+        m = _crear_mapa(
+            st.session_state.parcela_lat,
+            st.session_state.parcela_lon,
+            riesgo_txt,
+        )
 
-    st.subheader("Rendimiento del modelo (Random Forest)")
+        muestra = df.sample(min(80, len(df)), random_state=1)
+        for _, r in muestra.iterrows():
+            folium.CircleMarker(
+                [r["lat"], r["lon"]], radius=2,
+                color=COLOR_RIESGO[ETIQUETAS[r["riesgo"]]],
+                fill=True, fill_opacity=0.35, weight=1,
+            ).add_to(m)
+
+        map_data = st_folium(
+            m, height=420, width=None,
+            returned_objects=["last_clicked"],
+            key="mapa_parcela",
+        )
+
+        clicked = map_data.get("last_clicked") if map_data else None
+        if clicked and clicked.get("lat") is not None:
+            clat, clon = clicked["lat"], clicked["lng"]
+            prev = st.session_state.last_click
+            if prev is None or abs(prev[0] - clat) > 1e-5 or abs(prev[1] - clon) > 1e-5:
+                _actualizar_desde_mapa(clat, clon)
+                st.rerun()
+
+    except Exception as e:
+        st.warning(f"Mapa no disponible ({e}).")
+        st.dataframe(pd.DataFrame(
+            [(n, v["lat"], v["lon"]) for n, v in ZONAS_PARCELA.items()],
+            columns=["Zona", "Lat", "Lon"],
+        ))
+
+    st.subheader("Rendimiento del modelo")
     mc1, mc2, mc3 = st.columns(3)
     mc1.metric("Accuracy", metricas["accuracy"])
     mc2.metric("F1 (macro)", metricas["f1_macro"])
     mc3.metric("AUC ROC", metricas["auc_roc"])
-    mc1.metric("Precision", metricas["precision_macro"])
-    mc2.metric("Recall", metricas["recall_macro"])
 
-    st.write("**Matriz de confusion** (filas=real, col=predicho)")
-    cm = pd.DataFrame(metricas["matriz_confusion"],
-                      index=["Bajo", "Medio", "Alto"],
-                      columns=["Bajo", "Medio", "Alto"])
-    st.dataframe(cm)
-
-    st.write("**Importancia de variables** (por que decide el modelo)")
     imp = pd.Series(metricas["importancias"]).sort_values(ascending=True)
     st.bar_chart(imp)
 
 st.divider()
-st.caption("Tamizaje preliminar de apoyo a la decision. No reemplaza analisis "
-           "de laboratorio certificado (EPA 6020 / ICP-MS). Datos sinteticos "
-           "calibrados con rangos de estudios reales de Arequipa.")
+st.caption(
+    "Tamizaje preliminar. No reemplaza analisis de laboratorio certificado (ICP-MS). "
+    "Distancias calculadas con geopy (geodesica). pH por lookup regional o dato manual."
+)
